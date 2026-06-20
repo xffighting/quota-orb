@@ -34,6 +34,7 @@ Quota Orb puts both windows **on your screen, color-coded, always visible**. One
 - **Click to jump** — click an orb to bring its app to front (Claude.app / Codex).
 - **Hover for detail** — exact reset times, usage %, and a one-line verdict.
 - **Official, real-time data** — read **100% locally**, costs **zero quota**.
+- **Bilingual** — UI auto-switches to English or 中文 based on your system language.
 - **Auto-start on login**, drag anywhere, remembers position.
 
 ## 🔒 Privacy first
@@ -70,7 +71,8 @@ Each probe is a small, readable script (`*-probe.mjs` + `lib/*.py`). The orb its
 
 PRs very welcome — some good first issues:
 
-- [ ] **English UI** — the in-app labels are currently Chinese; i18n is a great first PR.
+- [x] **Bilingual UI (English / 中文)** — auto-detects system language. ✅
+- [ ] More languages (日本語, Español, …) — see the `L(...)` helper in `QuotaOrb.swift`.
 - [ ] More providers (Gemini, MiniMax, Cursor, …) — the architecture is provider-pluggable.
 - [ ] Menu-bar mode as an alternative to the floating orb.
 - [ ] Configurable thresholds & refresh interval via a settings file.

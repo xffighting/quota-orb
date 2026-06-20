@@ -39,6 +39,12 @@ func hexColor(_ hex: UInt32) -> NSColor {
             blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
 }
 
+// 按系统语言自动中/英（中文系统→中文，其它→英文）
+let kIsZh: Bool = (Locale.preferredLanguages.first?.hasPrefix("zh")) ?? false
+func L(_ zh: String, _ en: String) -> String { kIsZh ? zh : en }
+let kDateLocale = Locale(identifier: kIsZh ? "zh_CN" : "en_US")
+let kWeekdayFmt = kIsZh ? "E HH:mm" : "EEE HH:mm"
+
 // MARK: - Provider 定义
 struct Provider {
     let id: String
@@ -156,10 +162,12 @@ final class DataStore {
     var advice: String {
         switch state {
         case .idle:
-            return provider.id == "claude" ? "窗口未开启，发条消息即开新的 5 小时窗口" : "暂无数据，跑一次 \(provider.name) 即点亮"
-        case .healthy: return "消耗节奏健康，放心用"
-        case .slow: return "用得偏慢，额度别攒着"
-        case .critical: return "大量额度即将清零——快用起来"
+            return provider.id == "claude"
+                ? L("窗口未开启，发条消息即开新的 5 小时窗口", "No active window — send a message to start a 5h window")
+                : L("暂无数据，跑一次 \(provider.name) 即点亮", "No data — run \(provider.name) once to light up")
+        case .healthy: return L("消耗节奏健康，放心用", "Healthy pace — go ahead")
+        case .slow: return L("用得偏慢，额度别攒着", "Under-using — don't hoard quota")
+        case .critical: return L("大量额度即将清零——快用起来", "Lots of quota resets soon — use it!")
         }
     }
 
@@ -188,7 +196,8 @@ final class DataStore {
     var weekCountdownText: String {         // 卡片用：详细
         guard let mins = weekMinutesLeft else { return "—" }
         let m = Int(mins.rounded())
-        if m >= 1440 { let d = m / 1440, h = (m % 1440) / 60; return h > 0 ? "\(d)天\(h)h" : "\(d)天" }
+        if m >= 1440 { let d = m / 1440, h = (m % 1440) / 60
+            return h > 0 ? L("\(d)天\(h)h", "\(d)d\(h)h") : L("\(d)天", "\(d)d") }
         if m >= 60 { return String(format: "%dh%02dm", m / 60, m % 60) }
         return "\(m)m"
     }
@@ -441,45 +450,50 @@ final class CardController {
 
     private func ageText(_ u: Usage) -> String {
         guard let a = u.dataAge else { return "" }
-        if a < 1 { return " · 刚刷新" }
-        if a < 60 { return " · \(a) 分钟前" }
-        return " · \(a / 60)h\(a % 60)m 前"
+        if a < 1 { return L(" · 刚刷新", " · just now") }
+        if a < 60 { return L(" · \(a) 分钟前", " · \(a)m ago") }
+        return L(" · \(a / 60)h\(a % 60)m 前", " · \(a / 60)h\(a % 60)m ago")
     }
 
     func update() {
         let name = store.provider.name
         if let u = store.usage, u.hasData {
-            let srcTag = u.isOfficial ? "官方数据" : "本地估算"
-            titleLabel.stringValue = "\(name) 额度 · \(srcTag)\(ageText(u))"
+            let srcTag = u.isOfficial ? L("官方数据", "official") : L("本地估算", "local estimate")
+            titleLabel.stringValue = "\(name) · \(srcTag)\(ageText(u))"
             fiveBar.pct = store.minutesLeft == nil ? 0 : u.five.pct
             weekBar.pct = u.week.pct
+            let fp = Int(u.five.pct.rounded()), wp = Int(u.week.pct.rounded())
 
             if let reset = store.resetDate, store.minutesLeft != nil {
                 let f = DateFormatter()
                 f.dateFormat = "HH:mm"
-                fiveLine1.stringValue = "5 小时 · 已用 \(Int(u.five.pct.rounded()))%"
-                fiveLine2.stringValue = "还剩 \(store.countdownText) → \(f.string(from: reset)) 重置"
+                fiveLine1.stringValue = L("5 小时 · 已用 \(fp)%", "5h window · \(fp)% used")
+                fiveLine2.stringValue = L("还剩 \(store.countdownText) → \(f.string(from: reset)) 重置",
+                                         "\(store.countdownText) left → resets \(f.string(from: reset))")
             } else {
-                fiveLine1.stringValue = "5 小时窗口 · 暂无数据"
-                fiveLine2.stringValue = store.provider.id == "chatgpt" ? "跑一次 \(name) 即刷新" : "发条消息即开始计时"
+                fiveLine1.stringValue = L("5 小时窗口 · 暂无数据", "5h window · no data")
+                fiveLine2.stringValue = store.provider.id == "chatgpt"
+                    ? L("跑一次 \(name) 即刷新", "run \(name) once to refresh")
+                    : L("发条消息即开始计时", "send a message to start")
             }
 
             if let wReset = store.weekResetDate {
                 let wf = DateFormatter()
-                wf.locale = Locale(identifier: "zh_CN")
-                wf.dateFormat = "E HH:mm"
-                weekLine.stringValue = "周 · 已用 \(Int(u.week.pct.rounded()))% · 还剩 \(store.weekCountdownText) → \(wf.string(from: wReset)) 重置"
+                wf.locale = kDateLocale
+                wf.dateFormat = kWeekdayFmt
+                weekLine.stringValue = L("周 · 已用 \(wp)% · 还剩 \(store.weekCountdownText) → \(wf.string(from: wReset)) 重置",
+                                        "Week · \(wp)% used · \(store.weekCountdownText) left → resets \(wf.string(from: wReset))")
             } else {
-                weekLine.stringValue = "周 · 已用 \(Int(u.week.pct.rounded()))%"
+                weekLine.stringValue = L("周 · 已用 \(wp)%", "Week · \(wp)% used")
             }
         } else if store.usage != nil {
-            titleLabel.stringValue = "\(name) 额度 · 未配置"
-            fiveLine1.stringValue = "还没在本机用过 \(name)"
-            fiveLine2.stringValue = "用一次即点亮"
+            titleLabel.stringValue = "\(name) · \(L("未配置", "not set up"))"
+            fiveLine1.stringValue = L("还没在本机用过 \(name)", "Haven't used \(name) on this Mac yet")
+            fiveLine2.stringValue = L("用一次即点亮", "use it once to light up")
             weekLine.stringValue = ""
         } else {
-            titleLabel.stringValue = "\(name) 额度"
-            fiveLine1.stringValue = "数据加载中…"
+            titleLabel.stringValue = name
+            fiveLine1.stringValue = L("数据加载中…", "Loading…")
             fiveLine2.stringValue = store.lastError ?? ""
             weekLine.stringValue = ""
         }
@@ -598,15 +612,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func makeMenu() -> NSMenu {
         let menu = NSMenu()
-        let refresh = NSMenuItem(title: "立即刷新", action: #selector(doRefresh), keyEquivalent: "")
+        let refresh = NSMenuItem(title: L("立即刷新", "Refresh now"), action: #selector(doRefresh), keyEquivalent: "")
         refresh.target = self
         menu.addItem(refresh)
-        let auto = NSMenuItem(title: "随登录启动", action: #selector(toggleLaunchAgent), keyEquivalent: "")
+        let auto = NSMenuItem(title: L("随登录启动", "Launch at login"), action: #selector(toggleLaunchAgent), keyEquivalent: "")
         auto.target = self
         auto.state = FileManager.default.fileExists(atPath: kLaunchAgentPath) ? .on : .off
         menu.addItem(auto)
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: L("退出", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         return menu
     }
