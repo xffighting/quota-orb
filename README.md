@@ -13,6 +13,8 @@ A tiny, glanceable floating orb for macOS that shows your **AI subscription limi
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/xffighting/quota-orb/pulls)
 
+**English** · [中文](README.zh-CN.md)
+
 </div>
 
 ---
