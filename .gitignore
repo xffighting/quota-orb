@@ -1,0 +1,16 @@
+# 本地编译产物（install.sh 在用户机器上现编）
+quota-orb
+*.o
+*.swiftmodule
+
+# 运行时日志
+orb.log
+*.log
+
+# macOS
+.DS_Store
+
+# 本地个人数据（正常不在仓库内，双保险）
+.config/
+*.token
+credentials.json
