@@ -3,10 +3,64 @@ import AppKit
 // MARK: - 配置
 let kRefreshInterval: TimeInterval = 120
 let kTickInterval: TimeInterval = 20
-let kOrbSize: CGFloat = 84
 let kRingAlpha: CGFloat = 0.5   // 圈圈半透明，不抢视线
 let kLaunchAgentLabel = "com.quota-orb.app"
 let kLaunchAgentPath = NSString(string: "~/Library/LaunchAgents/\(kLaunchAgentLabel).plist").expandingTildeInPath
+
+// 贴边 / 吸附 / 自动隐藏 参数
+let kSnapThreshold: CGFloat = 90    // 松手时球心离边多近才吸附
+let kEdgeMargin: CGFloat = 6        // 吸附后离屏幕边缘留的缝
+let kPeek: CGFloat = 10             // 自动隐藏后露在屏内的一小条宽度
+let kHideDelay: TimeInterval = 0.8  // 鼠标移开后多久收起
+let kSlideDur: TimeInterval = 0.22  // 滑入 / 滑出动画时长
+
+// 屏幕四边
+enum Edge { case left, right, top, bottom }
+
+// 球大小三档
+func orbSizeFor(_ scale: String) -> CGFloat {
+    switch scale { case "small": return 72; case "large": return 100; default: return 84 }
+}
+
+// MARK: - 用户设置（右键菜单可定制，持久化到 ~/.config/quota-orb/settings.json）
+final class Settings {
+    static let shared = Settings()
+    private let url = URL(fileURLWithPath:
+        NSString(string: "~/.config/quota-orb/settings.json").expandingTildeInPath)
+
+    var snapToEdge = true             // 拖动松手自动贴最近边
+    var autoHide = true               // 贴边后自动收起、鼠标靠近滑出（默认开）
+    var orbScale = "medium"           // small / medium / large
+    var dimmed = false                // 整体半透明
+    var hiddenProviders: Set<String> = []   // 隐藏的 provider id
+
+    private struct Blob: Codable {
+        var snapToEdge: Bool; var autoHide: Bool
+        var orbScale: String; var dimmed: Bool; var hiddenProviders: [String]
+    }
+
+    init() { load() }
+
+    func load() {
+        guard let d = try? Data(contentsOf: url),
+              let b = try? JSONDecoder().decode(Blob.self, from: d) else { return }
+        snapToEdge = b.snapToEdge; autoHide = b.autoHide
+        orbScale = b.orbScale; dimmed = b.dimmed
+        hiddenProviders = Set(b.hiddenProviders)
+    }
+
+    func save() {
+        let b = Blob(snapToEdge: snapToEdge, autoHide: autoHide,
+                     orbScale: orbScale, dimmed: dimmed,
+                     hiddenProviders: Array(hiddenProviders))
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(b) { try? d.write(to: url) }
+    }
+}
+
+// 当前球径：启动时按设置取档；改大小时整体重建 unit 后更新
+var kOrbSize: CGFloat = orbSizeFor(Settings.shared.orbScale)
 
 // 可执行文件与脚本目录：随安装位置自适应（便于分享给朋友）
 let kBinaryPath: String = {
@@ -255,8 +309,12 @@ final class OrbView: NSView {
     let store: DataStore
     var onHover: ((Bool) -> Void)?
     var onClick: (() -> Void)?
+    var onDragBegan: (() -> Void)?
+    var onDragEnded: (() -> Void)?
     var menuProvider: (() -> NSMenu)?
-    private var dragOrigin: NSPoint?
+    private var dragMouseStart: NSPoint?   // 按下时全局鼠标位置
+    private var dragWinStart: NSPoint?     // 按下时窗口原点
+    private var didDrag = false
     private let haloLayer = CAShapeLayer()
     private var breathing = false
 
@@ -266,11 +324,16 @@ final class OrbView: NSView {
         wantsLayer = true
         haloLayer.fillColor = NSColor.clear.cgColor
         haloLayer.lineWidth = 2.0
-        let r = kOrbSize / 2 - 2
-        haloLayer.path = CGPath(ellipseIn: CGRect(x: kOrbSize / 2 - r, y: kOrbSize / 2 - r, width: r * 2, height: r * 2), transform: nil)
         layer?.addSublayer(haloLayer)
+        layoutHalo()
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() { super.layout(); layoutHalo() }
+    private func layoutHalo() {
+        let s = bounds.width, r = s / 2 - 2
+        haloLayer.path = CGPath(ellipseIn: CGRect(x: s / 2 - r, y: s / 2 - r, width: r * 2, height: r * 2), transform: nil)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -284,15 +347,20 @@ final class OrbView: NSView {
     override func mouseExited(with event: NSEvent) { onHover?(false) }
 
     override func mouseDown(with event: NSEvent) {
-        dragOrigin = window?.frame.origin
-        super.mouseDown(with: event)
+        dragMouseStart = NSEvent.mouseLocation
+        dragWinStart = window?.frame.origin
+        didDrag = false
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let ms = dragMouseStart, let ws = dragWinStart, let win = window else { return }
+        let now = NSEvent.mouseLocation
+        let dx = now.x - ms.x, dy = now.y - ms.y
+        if !didDrag, abs(dx) > 2 || abs(dy) > 2 { didDrag = true; onDragBegan?() }
+        if didDrag { win.setFrameOrigin(NSPoint(x: ws.x + dx, y: ws.y + dy)) }
     }
     override func mouseUp(with event: NSEvent) {
-        if let o = dragOrigin, let n = window?.frame.origin,
-           abs(o.x - n.x) < 2, abs(o.y - n.y) < 2 {
-            onClick?()
-        }
-        super.mouseUp(with: event)
+        if didDrag { onDragEnded?() } else { onClick?() }
+        dragMouseStart = nil; dragWinStart = nil; didDrag = false
     }
     override func rightMouseDown(with event: NSEvent) {
         if let menu = menuProvider?() {
@@ -323,7 +391,7 @@ final class OrbView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let c = NSPoint(x: bounds.midX, y: bounds.midY)
 
-        let bgR = kOrbSize / 2 - 6
+        let bgR = bounds.width / 2 - 6
         let bg = NSBezierPath(ovalIn: NSRect(x: c.x - bgR, y: c.y - bgR, width: bgR * 2, height: bgR * 2))
         NSColor.windowBackgroundColor.withAlphaComponent(0.97).setFill()
         bg.fill()
@@ -525,6 +593,13 @@ final class OrbUnit {
     let orbView: OrbView
     let card: CardController
 
+    // 贴边 / 自动隐藏 状态
+    var edge: Edge?              // 当前贴的边（nil = 自由放置，不参与自动隐藏）
+    var anchorFrame: NSRect?     // 贴边后的完整（展开）位置
+    private(set) var collapsed = false
+    private var hovering = false
+    private var hideWork: DispatchWorkItem?
+
     init(provider: Provider, index: Int) {
         store = DataStore(provider: provider)
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: kOrbSize, height: kOrbSize),
@@ -534,7 +609,7 @@ final class OrbUnit {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false   // 改用自定义拖动，便于松手吸附
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -543,16 +618,23 @@ final class OrbUnit {
         panel.contentView = orbView
         card = CardController(store: store)
 
-        // 纯悬停：鼠标进入即弹出细节，移开即关闭，不保持、不重开
+        // 悬停：进入即展开（若已收起）+ 弹细节卡片；移开即收卡片并安排自动隐藏
         orbView.onHover = { [weak self] inside in
             guard let self = self else { return }
+            self.hovering = inside
             if inside {
-                self.card.show(near: self.panel.frame)
+                self.hideWork?.cancel()
+                let ref = self.collapsed ? (self.anchorFrame ?? self.panel.frame) : self.panel.frame
+                self.expand()
+                self.card.show(near: ref)
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
                     guard let self = self else { return }
                     let p = self.orbView.window?.mouseLocationOutsideOfEventStream ?? .zero
-                    if !self.orbView.bounds.contains(p) { self.card.hide() }
+                    if !self.orbView.bounds.contains(p) {
+                        self.card.hide()
+                        self.scheduleCollapse()
+                    }
                 }
             }
         }
@@ -561,14 +643,138 @@ final class OrbUnit {
             guard let self = self else { return }
             openProviderApp(self.store.provider)
         }
+        // 拖动：开始时收卡片；松手吸附最近边并安排自动隐藏
+        orbView.onDragBegan = { [weak self] in
+            self?.hideWork?.cancel()
+            self?.collapsed = false
+            self?.card.hide()
+        }
+        orbView.onDragEnded = { [weak self] in
+            guard let self = self else { return }
+            self.snapToNearestEdge(animated: true)
+            self.scheduleCollapse()
+        }
 
-        panel.setFrameAutosaveName(provider.autosaveName)
-        if !panel.setFrameUsingName(provider.autosaveName), let screen = NSScreen.main {
+        // 定位：沿用上次保存的原点，但球径以当前档为准（避免改大小后被旧 frame 覆盖）
+        if panel.setFrameUsingName(provider.autosaveName) {
+            var f = panel.frame
+            f.size = NSSize(width: kOrbSize, height: kOrbSize)
+            panel.setFrame(f, display: false)
+        } else if let screen = NSScreen.main {
             let vf = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: vf.maxX - kOrbSize - 24,
                                          y: vf.maxY - kOrbSize - 24 - CGFloat(index) * (kOrbSize + 12)))
         }
         panel.orderFront(nil)
+        applyOpacity()
+        applyVisibility()
+        if Settings.shared.snapToEdge { snapToNearestEdge(animated: false) }
+        if Settings.shared.autoHide { scheduleCollapse() }
+    }
+
+    // MARK: 贴边吸附
+    private func currentScreen() -> NSScreen? {
+        NSScreen.screens.first(where: { $0.frame.intersects(panel.frame) }) ?? NSScreen.main
+    }
+
+    func snapToNearestEdge(animated: Bool) {
+        guard let screen = currentScreen() else { return }
+        let vf = screen.visibleFrame
+        var f = panel.frame
+        let cx = f.midX, cy = f.midY
+        let dl = cx - vf.minX, dr = vf.maxX - cx, db = cy - vf.minY, dt = vf.maxY - cy
+        let m = min(dl, dr, db, dt)
+        guard Settings.shared.snapToEdge, m < kSnapThreshold else {
+            edge = nil; anchorFrame = nil; collapsed = false; return   // 离边太远：自由放置
+        }
+        if m == dl { edge = .left;  f.origin.x = vf.minX + kEdgeMargin }
+        else if m == dr { edge = .right; f.origin.x = vf.maxX - f.width - kEdgeMargin }
+        else if m == db { edge = .bottom; f.origin.y = vf.minY + kEdgeMargin }
+        else { edge = .top; f.origin.y = vf.maxY - f.height - kEdgeMargin }
+        // 另一方向夹进可视区
+        f.origin.x = min(max(f.origin.x, vf.minX + kEdgeMargin), vf.maxX - f.width - kEdgeMargin)
+        f.origin.y = min(max(f.origin.y, vf.minY + kEdgeMargin), vf.maxY - f.height - kEdgeMargin)
+        anchorFrame = f
+        collapsed = false
+        setFrame(f, animated: animated)
+        panel.saveFrame(usingName: store.provider.autosaveName)
+    }
+
+    // MARK: 自动隐藏
+    private func collapsedFrame() -> NSRect? {
+        guard let e = edge, let a = anchorFrame, let screen = currentScreen() else { return nil }
+        let vf = screen.visibleFrame
+        var f = a
+        switch e {
+        case .left:   f.origin.x = vf.minX - f.width + kPeek
+        case .right:  f.origin.x = vf.maxX - kPeek
+        case .top:    f.origin.y = vf.maxY - kPeek
+        case .bottom: f.origin.y = vf.minY - f.height + kPeek
+        }
+        return f
+    }
+
+    func scheduleCollapse() {
+        hideWork?.cancel()
+        guard Settings.shared.autoHide, edge != nil else { return }
+        let w = DispatchWorkItem { [weak self] in self?.collapse() }
+        hideWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + kHideDelay, execute: w)
+    }
+
+    func collapse() {
+        guard Settings.shared.autoHide, !hovering, edge != nil, !collapsed,
+              let cf = collapsedFrame() else { return }
+        collapsed = true
+        setFrame(cf, animated: true)
+    }
+
+    func expand() {
+        guard collapsed, let a = anchorFrame else { return }
+        collapsed = false
+        setFrame(a, animated: true)
+    }
+
+    private func setFrame(_ f: NSRect, animated: Bool) {
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = kSlideDur
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                panel.animator().setFrame(f, display: true)
+            }
+        } else {
+            panel.setFrame(f, display: true)
+        }
+    }
+
+    // MARK: 设置应用
+    func applyOpacity() { panel.alphaValue = Settings.shared.dimmed ? 0.45 : 1.0 }
+
+    func applyVisibility() {
+        if Settings.shared.hiddenProviders.contains(store.provider.id) {
+            hideWork?.cancel(); card.hide(); panel.orderOut(nil)
+        } else if !panel.isVisible {
+            panel.orderFront(nil)
+        }
+    }
+
+    // 取消自动隐藏：展开复位，但保留贴边
+    func showFully() {
+        hideWork?.cancel()
+        if collapsed, let a = anchorFrame { collapsed = false; setFrame(a, animated: true) }
+    }
+
+    // 关闭贴边后：展开复位并清边
+    func releaseEdge() {
+        showFully()
+        edge = nil; anchorFrame = nil
+    }
+
+    func teardown() {
+        hideWork?.cancel()
+        card.hide()
+        panel.orderOut(nil)
+        panel.close()
     }
 
     func refresh(completion: @escaping () -> Void) {
@@ -611,14 +817,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func makeMenu() -> NSMenu {
+        let s = Settings.shared
         let menu = NSMenu()
+
         let refresh = NSMenuItem(title: L("立即刷新", "Refresh now"), action: #selector(doRefresh), keyEquivalent: "")
         refresh.target = self
         menu.addItem(refresh)
+
+        menu.addItem(.separator())
+
+        let snap = NSMenuItem(title: L("贴边吸附", "Snap to edge"), action: #selector(toggleSnap), keyEquivalent: "")
+        snap.target = self; snap.state = s.snapToEdge ? .on : .off
+        menu.addItem(snap)
+
+        let hide = NSMenuItem(title: L("自动隐藏", "Auto-hide"), action: #selector(toggleAutoHide), keyEquivalent: "")
+        hide.target = self; hide.state = s.autoHide ? .on : .off
+        hide.isEnabled = s.snapToEdge   // 自动隐藏依赖贴边
+        menu.addItem(hide)
+
+        // 外观子菜单：球大小 + 半透明
+        let look = NSMenuItem(title: L("外观", "Appearance"), action: nil, keyEquivalent: "")
+        let lookMenu = NSMenu()
+        for (key, zh, en) in [("small", "小", "Small"), ("medium", "中", "Medium"), ("large", "大", "Large")] {
+            let it = NSMenuItem(title: L(zh, en), action: #selector(setScale(_:)), keyEquivalent: "")
+            it.target = self; it.representedObject = key; it.state = (s.orbScale == key) ? .on : .off
+            lookMenu.addItem(it)
+        }
+        lookMenu.addItem(.separator())
+        let dim = NSMenuItem(title: L("半透明", "Dimmed"), action: #selector(toggleDim), keyEquivalent: "")
+        dim.target = self; dim.state = s.dimmed ? .on : .off
+        lookMenu.addItem(dim)
+        look.submenu = lookMenu
+        menu.addItem(look)
+
+        // 显示子菜单：各球显隐
+        let show = NSMenuItem(title: L("显示", "Show"), action: nil, keyEquivalent: "")
+        let showMenu = NSMenu()
+        for p in kProviders {
+            let it = NSMenuItem(title: p.name, action: #selector(toggleProvider(_:)), keyEquivalent: "")
+            it.target = self; it.representedObject = p.id
+            it.state = s.hiddenProviders.contains(p.id) ? .off : .on
+            showMenu.addItem(it)
+        }
+        show.submenu = showMenu
+        menu.addItem(show)
+
+        menu.addItem(.separator())
+
         let auto = NSMenuItem(title: L("随登录启动", "Launch at login"), action: #selector(toggleLaunchAgent), keyEquivalent: "")
         auto.target = self
         auto.state = FileManager.default.fileExists(atPath: kLaunchAgentPath) ? .on : .off
         menu.addItem(auto)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: L("退出", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
@@ -648,6 +898,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? data?.write(to: URL(fileURLWithPath: kLaunchAgentPath))
             _ = try? Process.run(URL(fileURLWithPath: "/bin/launchctl"), arguments: ["load", kLaunchAgentPath])
         }
+    }
+
+    // MARK: - 可定制项
+    @objc func toggleSnap() {
+        let s = Settings.shared
+        s.snapToEdge.toggle()
+        if !s.snapToEdge { s.autoHide = false }   // 不贴边则自动隐藏一并关
+        s.save()
+        units.forEach { s.snapToEdge ? $0.snapToNearestEdge(animated: true) : $0.releaseEdge() }
+    }
+
+    @objc func toggleAutoHide() {
+        let s = Settings.shared
+        guard s.snapToEdge else { return }
+        s.autoHide.toggle()
+        s.save()
+        units.forEach { s.autoHide ? $0.scheduleCollapse() : $0.showFully() }
+    }
+
+    @objc func setScale(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String, key != Settings.shared.orbScale else { return }
+        Settings.shared.orbScale = key
+        Settings.shared.save()
+        rebuildUnits()
+    }
+
+    @objc func toggleDim() {
+        Settings.shared.dimmed.toggle()
+        Settings.shared.save()
+        units.forEach { $0.applyOpacity() }
+    }
+
+    @objc func toggleProvider(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let s = Settings.shared
+        if s.hiddenProviders.contains(id) {
+            s.hiddenProviders.remove(id)
+        } else if s.hiddenProviders.count >= kProviders.count - 1 {
+            NSSound.beep(); return   // 至少保留一个球可见
+        } else {
+            s.hiddenProviders.insert(id)
+        }
+        s.save()
+        units.forEach { $0.applyVisibility() }
+    }
+
+    // 改球大小后整体重建（旧 panel 尺寸不可原地变更）
+    func rebuildUnits() {
+        kOrbSize = orbSizeFor(Settings.shared.orbScale)
+        units.forEach { $0.teardown() }
+        units.removeAll()
+        for (i, provider) in kProviders.enumerated() {
+            let unit = OrbUnit(provider: provider, index: i)
+            unit.orbView.menuProvider = { [weak self] in self?.makeMenu() ?? NSMenu() }
+            units.append(unit)
+        }
+        doRefresh()
     }
 }
 
