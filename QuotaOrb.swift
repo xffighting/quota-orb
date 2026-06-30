@@ -3,16 +3,17 @@ import AppKit
 // MARK: - 配置
 let kRefreshInterval: TimeInterval = 120
 let kTickInterval: TimeInterval = 20
-let kRingAlpha: CGFloat = 0.5   // 圈圈半透明，不抢视线
+let kRingAlpha: CGFloat = 0.62   // 圈圈半透明，水晶质感上略亮一点
 let kLaunchAgentLabel = "com.quota-orb.app"
 let kLaunchAgentPath = NSString(string: "~/Library/LaunchAgents/\(kLaunchAgentLabel).plist").expandingTildeInPath
 
 // 贴边 / 吸附 / 自动隐藏 参数
 let kSnapThreshold: CGFloat = 90    // 松手时球心离边多近才吸附
 let kEdgeMargin: CGFloat = 6        // 吸附后离屏幕边缘留的缝
-let kPeek: CGFloat = 10             // 自动隐藏后露在屏内的一小条宽度
-let kHideDelay: TimeInterval = 0.8  // 鼠标移开后多久收起
+let kPeek: CGFloat = 18             // 自动隐藏后露在屏内的一小条宽度（够大、好找回）
+let kHideDelay: TimeInterval = 1.5  // 鼠标移开后多久收起
 let kSlideDur: TimeInterval = 0.22  // 滑入 / 滑出动画时长
+let kClusterGap: CGFloat = 8        // 三球成组排列时彼此的间距
 
 // 屏幕四边
 enum Edge { case left, right, top, bottom }
@@ -29,14 +30,18 @@ final class Settings {
         NSString(string: "~/.config/quota-orb/settings.json").expandingTildeInPath)
 
     var snapToEdge = true             // 拖动松手自动贴最近边
-    var autoHide = true               // 贴边后自动收起、鼠标靠近滑出（默认开）
+    var autoHide = true               // 贴边后自动收起（仅外缘隐藏、锁定屏幕，找不到可右键「找回所有球」）
     var orbScale = "medium"           // small / medium / large
     var dimmed = false                // 整体半透明
     var hiddenProviders: Set<String> = []   // 隐藏的 provider id
+    var clusterX: Double? = nil       // 三球组锚点（第一颗球原点）
+    var clusterY: Double? = nil
+    var orientation = "v"             // 排列方向：v 竖排 / h 横排
 
     private struct Blob: Codable {
         var snapToEdge: Bool; var autoHide: Bool
         var orbScale: String; var dimmed: Bool; var hiddenProviders: [String]
+        var clusterX: Double?; var clusterY: Double?; var orientation: String?
     }
 
     init() { load() }
@@ -47,12 +52,15 @@ final class Settings {
         snapToEdge = b.snapToEdge; autoHide = b.autoHide
         orbScale = b.orbScale; dimmed = b.dimmed
         hiddenProviders = Set(b.hiddenProviders)
+        clusterX = b.clusterX; clusterY = b.clusterY
+        orientation = b.orientation ?? "v"
     }
 
     func save() {
         let b = Blob(snapToEdge: snapToEdge, autoHide: autoHide,
                      orbScale: orbScale, dimmed: dimmed,
-                     hiddenProviders: Array(hiddenProviders))
+                     hiddenProviders: Array(hiddenProviders),
+                     clusterX: clusterX, clusterY: clusterY, orientation: orientation)
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let d = try? JSONEncoder().encode(b) { try? d.write(to: url) }
@@ -146,6 +154,11 @@ let kProviders: [Provider] = [
              badge: "G", autosaveName: "QuotaOrbChatGPT",
              bundleIDs: ["com.openai.codex", "com.openai.chat"],
              openURL: "https://chatgpt.com"),
+    Provider(id: "minimax", name: "MiniMax",
+             probe: "\(kScriptDir)/minimax-probe.mjs",
+             accent: hexColor(0x378ADD), weekColor: hexColor(0xBA7517),
+             badge: "M", autosaveName: "QuotaOrbMiniMax",
+             bundleIDs: [], openURL: "https://platform.minimax.io/subscribe/token-plan"),
 ]
 
 // MARK: - 数据模型
@@ -158,10 +171,12 @@ struct Usage: Codable {
     let week: WinUsage
     let source: String?
     let dataAge: Int?
+    let weekUnlimited: Bool?
     let at: String
 
-    var isOfficial: Bool { source == "official" || source == "codex-official" }
-    var hasData: Bool { source != "codex-none" }
+    var isOfficial: Bool { source == "official" || source == "codex-official" || source == "minimax-official" }
+    var hasData: Bool { source != "codex-none" && source != "minimax-none" }
+    var isWeekUnlimited: Bool { weekUnlimited == true }
 }
 
 func parseISO(_ s: String?) -> Date? {
@@ -241,6 +256,7 @@ final class DataStore {
         return m > 0 ? m : nil
     }
     var weekCountdownShort: String {       // 球面用：尽量短
+        if usage?.isWeekUnlimited == true { return "∞" }
         guard let mins = weekMinutesLeft else { return "—" }
         let m = Int(mins.rounded())
         if m >= 1440 { return "\(m / 1440)d" }
@@ -310,10 +326,10 @@ final class OrbView: NSView {
     var onHover: ((Bool) -> Void)?
     var onClick: (() -> Void)?
     var onDragBegan: (() -> Void)?
+    var onDragMove: ((NSPoint) -> Void)?   // 拖动中：上报当前全局鼠标位置（由协调器移动整组）
     var onDragEnded: (() -> Void)?
     var menuProvider: (() -> NSMenu)?
     private var dragMouseStart: NSPoint?   // 按下时全局鼠标位置
-    private var dragWinStart: NSPoint?     // 按下时窗口原点
     private var didDrag = false
     private let haloLayer = CAShapeLayer()
     private var breathing = false
@@ -331,7 +347,7 @@ final class OrbView: NSView {
 
     override func layout() { super.layout(); layoutHalo() }
     private func layoutHalo() {
-        let s = bounds.width, r = s / 2 - 2
+        let s = bounds.width, r = s / 2 - 4.5
         haloLayer.path = CGPath(ellipseIn: CGRect(x: s / 2 - r, y: s / 2 - r, width: r * 2, height: r * 2), transform: nil)
     }
 
@@ -348,19 +364,17 @@ final class OrbView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         dragMouseStart = NSEvent.mouseLocation
-        dragWinStart = window?.frame.origin
         didDrag = false
     }
     override func mouseDragged(with event: NSEvent) {
-        guard let ms = dragMouseStart, let ws = dragWinStart, let win = window else { return }
+        guard let ms = dragMouseStart else { return }
         let now = NSEvent.mouseLocation
-        let dx = now.x - ms.x, dy = now.y - ms.y
-        if !didDrag, abs(dx) > 2 || abs(dy) > 2 { didDrag = true; onDragBegan?() }
-        if didDrag { win.setFrameOrigin(NSPoint(x: ws.x + dx, y: ws.y + dy)) }
+        if !didDrag, abs(now.x - ms.x) > 2 || abs(now.y - ms.y) > 2 { didDrag = true; onDragBegan?() }
+        if didDrag { onDragMove?(now) }
     }
     override func mouseUp(with event: NSEvent) {
         if didDrag { onDragEnded?() } else { onClick?() }
-        dragMouseStart = nil; dragWinStart = nil; didDrag = false
+        dragMouseStart = nil; didDrag = false
     }
     override func rightMouseDown(with event: NSEvent) {
         if let menu = menuProvider?() {
@@ -392,9 +406,34 @@ final class OrbView: NSView {
         let c = NSPoint(x: bounds.midX, y: bounds.midY)
 
         let bgR = bounds.width / 2 - 6
-        let bg = NSBezierPath(ovalIn: NSRect(x: c.x - bgR, y: c.y - bgR, width: bgR * 2, height: bgR * 2))
-        NSColor.windowBackgroundColor.withAlphaComponent(0.97).setFill()
-        bg.fill()
+        let rect = NSRect(x: c.x - bgR, y: c.y - bgR, width: bgR * 2, height: bgR * 2)
+        let body = NSBezierPath(ovalIn: rect)
+
+        // 水晶球体：径向渐变（顶部偏白→边缘淡冷色），略透明，像一颗玻璃珠
+        NSGraphicsContext.saveGraphicsState()
+        body.addClip()
+        if let g = NSGradient(colors: [
+            NSColor.white.withAlphaComponent(0.96),
+            NSColor.white.withAlphaComponent(0.85),
+            hexColor(0xE7EEF6).withAlphaComponent(0.82),
+        ]) {
+            g.draw(in: body, relativeCenterPosition: NSPoint(x: -0.12, y: 0.40))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        // 顶部玻璃高光（柔和反光）
+        NSGraphicsContext.saveGraphicsState()
+        body.addClip()
+        let glossRect = NSRect(x: c.x - bgR * 0.58, y: c.y + bgR * 0.18, width: bgR * 1.16, height: bgR * 0.9)
+        if let gg = NSGradient(colors: [NSColor.white.withAlphaComponent(0.0), NSColor.white.withAlphaComponent(0.58)]) {
+            gg.draw(in: NSBezierPath(ovalIn: glossRect), angle: 90)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        // 玻璃边缘高光
+        NSColor.white.withAlphaComponent(0.65).setStroke()
+        let rim = NSBezierPath(ovalIn: rect.insetBy(dx: 0.6, dy: 0.6)); rim.lineWidth = 1
+        rim.stroke()
 
         // 双环：外=5小时、内=周；半透明、贴外缘，给中心文字留出干净区
         let fivePct = store.usage?.five.pct ?? 0
@@ -529,7 +568,7 @@ final class CardController {
             let srcTag = u.isOfficial ? L("官方数据", "official") : L("本地估算", "local estimate")
             titleLabel.stringValue = "\(name) · \(srcTag)\(ageText(u))"
             fiveBar.pct = store.minutesLeft == nil ? 0 : u.five.pct
-            weekBar.pct = u.week.pct
+            weekBar.pct = u.isWeekUnlimited ? 0 : u.week.pct
             let fp = Int(u.five.pct.rounded()), wp = Int(u.week.pct.rounded())
 
             if let reset = store.resetDate, store.minutesLeft != nil {
@@ -545,7 +584,9 @@ final class CardController {
                     : L("发条消息即开始计时", "send a message to start")
             }
 
-            if let wReset = store.weekResetDate {
+            if u.isWeekUnlimited {
+                weekLine.stringValue = L("周 · 不限量 ∞", "Weekly · unlimited ∞")
+            } else if let wReset = store.weekResetDate {
                 let wf = DateFormatter()
                 wf.locale = kDateLocale
                 wf.dateFormat = kWeekdayFmt
@@ -557,7 +598,9 @@ final class CardController {
         } else if store.usage != nil {
             titleLabel.stringValue = "\(name) · \(L("未配置", "not set up"))"
             fiveLine1.stringValue = L("还没在本机用过 \(name)", "Haven't used \(name) on this Mac yet")
-            fiveLine2.stringValue = L("用一次即点亮", "use it once to light up")
+            fiveLine2.stringValue = store.provider.id == "minimax"
+                ? L("在 Chrome 登录 minimax.io 即点亮", "log in to minimax.io in Chrome to light up")
+                : L("用一次即点亮", "use it once to light up")
             weekLine.stringValue = ""
         } else {
             titleLabel.stringValue = name
@@ -598,7 +641,11 @@ final class OrbUnit {
     var anchorFrame: NSRect?     // 贴边后的完整（展开）位置
     private(set) var collapsed = false
     private var hovering = false
+    var isHovering: Bool { hovering }
     private var hideWork: DispatchWorkItem?
+    private var lockedScreen: NSScreen?   // 吸附时锁定的屏幕，避免折叠滑到邻屏后判定漂移
+    private var edgeIsOuter = false       // 当前贴的边是否为桌面外缘（外缘才允许自动隐藏）
+    var onHoverChanged: ((Bool) -> Void)?   // 由协调器接管：整组展开 / 计划收起
 
     init(provider: Provider, index: Int) {
         store = DataStore(provider: provider)
@@ -608,7 +655,7 @@ final class OrbUnit {
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
+        panel.hasShadow = true   // 柔和投影，水晶珠悬浮感
         panel.isMovableByWindowBackground = false   // 改用自定义拖动，便于松手吸附
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
@@ -618,14 +665,13 @@ final class OrbUnit {
         panel.contentView = orbView
         card = CardController(store: store)
 
-        // 悬停：进入即展开（若已收起）+ 弹细节卡片；移开即收卡片并安排自动隐藏
+        // 悬停：进入即弹细节卡片，并通知协调器整组展开；移开即收卡片并通知整组计划收起
         orbView.onHover = { [weak self] inside in
             guard let self = self else { return }
             self.hovering = inside
             if inside {
-                self.hideWork?.cancel()
+                self.onHoverChanged?(true)
                 let ref = self.collapsed ? (self.anchorFrame ?? self.panel.frame) : self.panel.frame
-                self.expand()
                 self.card.show(near: ref)
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
@@ -633,38 +679,17 @@ final class OrbUnit {
                     let p = self.orbView.window?.mouseLocationOutsideOfEventStream ?? .zero
                     if !self.orbView.bounds.contains(p) {
                         self.card.hide()
-                        self.scheduleCollapse()
+                        self.onHoverChanged?(false)
                     }
                 }
             }
         }
-        // 单击悬浮球：唤起/切换到对应应用窗口
+        // 单击悬浮球：唤起/切换到对应应用窗口（拖动逻辑由协调器接管）
         orbView.onClick = { [weak self] in
             guard let self = self else { return }
             openProviderApp(self.store.provider)
         }
-        // 拖动：开始时收卡片；松手吸附最近边并安排自动隐藏
-        orbView.onDragBegan = { [weak self] in
-            self?.hideWork?.cancel()
-            self?.collapsed = false
-            self?.card.hide()
-        }
-        orbView.onDragEnded = { [weak self] in
-            guard let self = self else { return }
-            self.snapToNearestEdge(animated: true)
-            self.scheduleCollapse()
-        }
 
-        // 定位：沿用上次保存的原点，但球径以当前档为准（避免改大小后被旧 frame 覆盖）
-        if panel.setFrameUsingName(provider.autosaveName) {
-            var f = panel.frame
-            f.size = NSSize(width: kOrbSize, height: kOrbSize)
-            panel.setFrame(f, display: false)
-        } else if let screen = NSScreen.main {
-            let vf = screen.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: vf.maxX - kOrbSize - 24,
-                                         y: vf.maxY - kOrbSize - 24 - CGFloat(index) * (kOrbSize + 12)))
-        }
         panel.orderFront(nil)
         applyOpacity()
         applyVisibility()
@@ -673,19 +698,52 @@ final class OrbUnit {
     }
 
     // MARK: 贴边吸附
-    private func currentScreen() -> NSScreen? {
-        NSScreen.screens.first(where: { $0.frame.intersects(panel.frame) }) ?? NSScreen.main
+    // 以球心所在屏幕为准（更稳：折叠滑到邻屏也不会误判）
+    private func screenForOrb() -> NSScreen? {
+        let c = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        return NSScreen.screens.first(where: { NSPointInRect(c, $0.frame) })
+            ?? NSScreen.screens.first(where: { $0.frame.intersects(panel.frame) })
+            ?? NSScreen.main
+    }
+    private func currentScreen() -> NSScreen? { lockedScreen ?? screenForOrb() }
+
+    // 这条边外侧是否还有别的显示器（有=内边，不该往那折叠隐藏）
+    private func isOuterEdge(_ e: Edge, _ screen: NSScreen) -> Bool {
+        let f = screen.frame
+        for s in NSScreen.screens where s != screen {
+            let g = s.frame
+            switch e {
+            case .right:  if abs(g.minX - f.maxX) < 4, g.maxY > f.minY, g.minY < f.maxY { return false }
+            case .left:   if abs(g.maxX - f.minX) < 4, g.maxY > f.minY, g.minY < f.maxY { return false }
+            case .top:    if abs(g.minY - f.maxY) < 4, g.maxX > f.minX, g.minX < f.maxX { return false }
+            case .bottom: if abs(g.maxY - f.minY) < 4, g.maxX > f.minX, g.minX < f.maxX { return false }
+            }
+        }
+        return true
+    }
+
+    // 屏幕配置变化（插拔/分辨率变更）后重新校正位置，避免丢失或卡在已消失的屏
+    func revalidatePosition() {
+        hideWork?.cancel()
+        let onScreen = NSScreen.screens.contains { $0.visibleFrame.intersects(panel.frame) }
+        if !onScreen, let vf = NSScreen.main?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(x: vf.maxX - kOrbSize - 24, y: vf.maxY - kOrbSize - 24))
+        }
+        lockedScreen = nil; collapsed = false
+        if Settings.shared.snapToEdge { snapToNearestEdge(animated: false) }
+        if Settings.shared.autoHide { scheduleCollapse() }
     }
 
     func snapToNearestEdge(animated: Bool) {
-        guard let screen = currentScreen() else { return }
+        guard let screen = screenForOrb() else { return }
         let vf = screen.visibleFrame
         var f = panel.frame
         let cx = f.midX, cy = f.midY
         let dl = cx - vf.minX, dr = vf.maxX - cx, db = cy - vf.minY, dt = vf.maxY - cy
         let m = min(dl, dr, db, dt)
         guard Settings.shared.snapToEdge, m < kSnapThreshold else {
-            edge = nil; anchorFrame = nil; collapsed = false; return   // 离边太远：自由放置
+            edge = nil; anchorFrame = nil; collapsed = false
+            lockedScreen = nil; edgeIsOuter = false; return   // 离边太远：自由放置
         }
         if m == dl { edge = .left;  f.origin.x = vf.minX + kEdgeMargin }
         else if m == dr { edge = .right; f.origin.x = vf.maxX - f.width - kEdgeMargin }
@@ -694,6 +752,8 @@ final class OrbUnit {
         // 另一方向夹进可视区
         f.origin.x = min(max(f.origin.x, vf.minX + kEdgeMargin), vf.maxX - f.width - kEdgeMargin)
         f.origin.y = min(max(f.origin.y, vf.minY + kEdgeMargin), vf.maxY - f.height - kEdgeMargin)
+        lockedScreen = screen                       // 锁定该屏，后续折叠/展开都以它为准
+        edgeIsOuter = isOuterEdge(edge!, screen)     // 只有外缘才允许自动隐藏
         anchorFrame = f
         collapsed = false
         setFrame(f, animated: animated)
@@ -716,14 +776,14 @@ final class OrbUnit {
 
     func scheduleCollapse() {
         hideWork?.cancel()
-        guard Settings.shared.autoHide, edge != nil else { return }
+        guard Settings.shared.autoHide, edge != nil, edgeIsOuter else { return }   // 仅外缘自动隐藏
         let w = DispatchWorkItem { [weak self] in self?.collapse() }
         hideWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + kHideDelay, execute: w)
     }
 
     func collapse() {
-        guard Settings.shared.autoHide, !hovering, edge != nil, !collapsed,
+        guard Settings.shared.autoHide, edgeIsOuter, !hovering, edge != nil, !collapsed,
               let cf = collapsedFrame() else { return }
         collapsed = true
         setFrame(cf, animated: true)
@@ -770,6 +830,26 @@ final class OrbUnit {
         edge = nil; anchorFrame = nil
     }
 
+    // MARK: 协调器接口（三球成组定位）
+    var frameOrigin: NSPoint { panel.frame.origin }
+    func moveOrigin(_ p: NSPoint) { panel.setFrameOrigin(p) }
+    func prepareForDrag() {   // 拖动开始：若收着则立即（非动画）复位，再收卡片
+        hideWork?.cancel(); card.hide()
+        if collapsed, let a = anchorFrame { panel.setFrame(a, display: true) }
+        collapsed = false
+    }
+    func applySnapped(frame: NSRect, edge e: Edge, screen: NSScreen, outer: Bool, animated: Bool) {
+        hideWork?.cancel()
+        edge = e; lockedScreen = screen; edgeIsOuter = outer
+        anchorFrame = frame; collapsed = false
+        setFrame(frame, animated: animated)
+    }
+    func applyFree(frame: NSRect, animated: Bool) {
+        hideWork?.cancel()
+        edge = nil; anchorFrame = nil; lockedScreen = nil; edgeIsOuter = false; collapsed = false
+        setFrame(frame, animated: animated)
+    }
+
     func teardown() {
         hideWork?.cancel()
         card.hide()
@@ -798,13 +878,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var refreshTimer: Timer?
     var tickTimer: Timer?
 
+    // 三球成组协调
+    private var dragStartMouse: NSPoint?
+    private var dragStartOrigins: [NSPoint] = []
+    private var clusterHideWork: DispatchWorkItem?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
         for (i, provider) in kProviders.enumerated() {
             let unit = OrbUnit(provider: provider, index: i)
             unit.orbView.menuProvider = { [weak self] in self?.makeMenu() ?? NSMenu() }
+            unit.orbView.onDragBegan = { [weak self] in self?.clusterDragBegan() }
+            unit.orbView.onDragMove = { [weak self] m in self?.clusterDragMove(m) }
+            unit.orbView.onDragEnded = { [weak self] in self?.clusterDragEnded() }
+            unit.onHoverChanged = { [weak self] inside in
+                if inside { self?.expandCluster() } else { self?.scheduleClusterCollapse() }
+            }
             units.append(unit)
+        }
+        loadCluster()
+
+        // 显示器插拔 / 分辨率变化：整组重新校正，避免丢失或卡在已消失的屏
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.recoverCluster() }
         }
 
         doRefresh()
@@ -814,6 +913,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tickTimer = Timer.scheduledTimer(withTimeInterval: kTickInterval, repeats: true) { [weak self] _ in
             self?.units.forEach { $0.tick() }
         }
+    }
+
+    // MARK: - 三球成组：定位 / 拖动 / 吸附 / 隐藏
+    private func clusterFrames(anchor: NSPoint, orientation: String, count: Int) -> [NSRect] {
+        let step = kOrbSize + kClusterGap
+        return (0..<count).map { i in
+            var o = anchor
+            if orientation == "v" { o.y = anchor.y - CGFloat(i) * step }   // 竖排：第一颗在最上，往下排
+            else { o.x = anchor.x + CGFloat(i) * step }                    // 横排：第一颗在最左，往右排
+            return NSRect(x: o.x, y: o.y, width: kOrbSize, height: kOrbSize)
+        }
+    }
+
+    private func isOuterDesktopEdge(_ e: Edge, _ screen: NSScreen) -> Bool {
+        let f = screen.frame
+        for s in NSScreen.screens where s != screen {
+            let g = s.frame
+            switch e {
+            case .right:  if abs(g.minX - f.maxX) < 4, g.maxY > f.minY, g.minY < f.maxY { return false }
+            case .left:   if abs(g.maxX - f.minX) < 4, g.maxY > f.minY, g.minY < f.maxY { return false }
+            case .top:    if abs(g.minY - f.maxY) < 4, g.maxX > f.minX, g.minX < f.maxX { return false }
+            case .bottom: if abs(g.maxY - f.minY) < 4, g.maxX > f.minX, g.minX < f.maxX { return false }
+            }
+        }
+        return true
+    }
+
+    private func applyFrames(_ frames: [NSRect], snapped: Edge?, screen: NSScreen?, outer: Bool, animated: Bool) {
+        for (i, u) in units.enumerated() where i < frames.count {
+            if let e = snapped, let scr = screen {
+                u.applySnapped(frame: frames[i], edge: e, screen: scr, outer: outer, animated: animated)
+            } else {
+                u.applyFree(frame: frames[i], animated: animated)
+            }
+        }
+    }
+
+    // 按锚点(第一颗球原点)+方向铺开三球；贴边时方向随边（左右→竖排，上下→横排），并落盘
+    private func layoutCluster(anchor: NSPoint, orientation: String, animated: Bool) {
+        let count = units.count
+        guard count > 0 else { return }
+        var frames = clusterFrames(anchor: anchor, orientation: orientation, count: count)
+        let bbox = frames.dropFirst().reduce(frames[0]) { $0.union($1) }
+        let center = NSPoint(x: bbox.midX, y: bbox.midY)
+        let screen = NSScreen.screens.first(where: { NSPointInRect(center, $0.frame) })
+            ?? NSScreen.screens.first(where: { $0.frame.intersects(bbox) }) ?? NSScreen.main
+        guard let scr = screen else { applyFrames(frames, snapped: nil, screen: nil, outer: false, animated: animated); return }
+        let vf = scr.visibleFrame
+        let dl = center.x - vf.minX, dr = vf.maxX - center.x, db = center.y - vf.minY, dt = vf.maxY - center.y
+        let m = min(dl, dr, db, dt)
+        let step = kOrbSize + kClusterGap
+        let span = CGFloat(count - 1) * step
+        var ori = orientation, snapEdge: Edge? = nil, anchorPt = anchor
+
+        if Settings.shared.snapToEdge && m < kSnapThreshold {
+            if m == dl || m == dr {                       // 贴左右 → 竖排
+                ori = "v"
+                let x = (m == dl) ? vf.minX + kEdgeMargin : vf.maxX - kOrbSize - kEdgeMargin
+                let topMin = vf.minY + kEdgeMargin + span, topMax = vf.maxY - kOrbSize - kEdgeMargin
+                let topY = min(max(center.y + span / 2, topMin), topMax)
+                snapEdge = (m == dl) ? .left : .right
+                anchorPt = NSPoint(x: x, y: topY)
+            } else {                                      // 贴上下 → 横排
+                ori = "h"
+                let y = (m == db) ? vf.minY + kEdgeMargin : vf.maxY - kOrbSize - kEdgeMargin
+                let leftMin = vf.minX + kEdgeMargin, leftMax = vf.maxX - kEdgeMargin - kOrbSize - span
+                let leftX = min(max(center.x - span / 2, leftMin), leftMax)
+                snapEdge = (m == db) ? .bottom : .top
+                anchorPt = NSPoint(x: leftX, y: y)
+            }
+            frames = clusterFrames(anchor: anchorPt, orientation: ori, count: count)
+        } else {                                          // 自由放置：夹整组进可视区
+            let bb = frames.dropFirst().reduce(frames[0]) { $0.union($1) }
+            var ddx: CGFloat = 0, ddy: CGFloat = 0
+            if bb.minX < vf.minX + kEdgeMargin { ddx = vf.minX + kEdgeMargin - bb.minX }
+            else if bb.maxX > vf.maxX - kEdgeMargin { ddx = vf.maxX - kEdgeMargin - bb.maxX }
+            if bb.minY < vf.minY + kEdgeMargin { ddy = vf.minY + kEdgeMargin - bb.minY }
+            else if bb.maxY > vf.maxY - kEdgeMargin { ddy = vf.maxY - kEdgeMargin - bb.maxY }
+            anchorPt = NSPoint(x: anchor.x + ddx, y: anchor.y + ddy)
+            frames = clusterFrames(anchor: anchorPt, orientation: ori, count: count)
+        }
+
+        let outer = snapEdge.map { isOuterDesktopEdge($0, scr) } ?? false
+        applyFrames(frames, snapped: snapEdge, screen: scr, outer: outer, animated: animated)
+
+        Settings.shared.clusterX = Double(anchorPt.x)
+        Settings.shared.clusterY = Double(anchorPt.y)
+        Settings.shared.orientation = ori
+        Settings.shared.save()
+    }
+
+    private func loadCluster() {
+        let s = Settings.shared
+        if let cx = s.clusterX, let cy = s.clusterY {
+            layoutCluster(anchor: NSPoint(x: cx, y: cy), orientation: s.orientation, animated: false)
+        } else if let vf = NSScreen.main?.visibleFrame {
+            layoutCluster(anchor: NSPoint(x: vf.maxX - kOrbSize - 24, y: vf.maxY - kOrbSize - 24),
+                          orientation: "v", animated: false)
+        }
+        if s.autoHide { scheduleClusterCollapse() }
+    }
+
+    private func clusterOnAnyScreen() -> Bool {
+        units.contains { u in NSScreen.screens.contains { $0.visibleFrame.intersects(u.panel.frame) } }
+    }
+
+    private func recoverCluster() {
+        if !clusterOnAnyScreen(), let vf = NSScreen.main?.visibleFrame {
+            layoutCluster(anchor: NSPoint(x: vf.maxX - kOrbSize - 24, y: vf.maxY - kOrbSize - 24),
+                          orientation: Settings.shared.orientation, animated: false)
+        } else if let first = units.first {
+            layoutCluster(anchor: first.frameOrigin, orientation: Settings.shared.orientation, animated: false)
+        }
+    }
+
+    func clusterDragBegan() {
+        clusterHideWork?.cancel()
+        dragStartMouse = NSEvent.mouseLocation
+        units.forEach { $0.prepareForDrag() }   // 立即复位（非动画），保证起点正确
+        dragStartOrigins = units.map { $0.frameOrigin }
+    }
+    func clusterDragMove(_ mouse: NSPoint) {
+        guard let ms = dragStartMouse, dragStartOrigins.count == units.count else { return }
+        let dx = mouse.x - ms.x, dy = mouse.y - ms.y
+        for (i, u) in units.enumerated() {
+            u.moveOrigin(NSPoint(x: dragStartOrigins[i].x + dx, y: dragStartOrigins[i].y + dy))
+        }
+    }
+    func clusterDragEnded() {
+        guard let first = units.first else { return }
+        layoutCluster(anchor: first.frameOrigin, orientation: Settings.shared.orientation, animated: true)
+        scheduleClusterCollapse()
+    }
+
+    func scheduleClusterCollapse() {
+        clusterHideWork?.cancel()
+        guard Settings.shared.autoHide else { return }
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.units.contains(where: { $0.isHovering }) { return }
+            self.units.forEach { $0.collapse() }
+        }
+        clusterHideWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + kHideDelay, execute: w)
+    }
+    func expandCluster() {
+        clusterHideWork?.cancel()
+        units.forEach { $0.expand() }
     }
 
     func makeMenu() -> NSMenu {
@@ -834,6 +1081,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hide.target = self; hide.state = s.autoHide ? .on : .off
         hide.isEnabled = s.snapToEdge   // 自动隐藏依赖贴边
         menu.addItem(hide)
+
+        // 找回所有球（万一藏起来找不到，一键全部弹出）
+        let summon = NSMenuItem(title: L("找回所有球", "Show all orbs"), action: #selector(summonAll), keyEquivalent: "")
+        summon.target = self
+        menu.addItem(summon)
 
         // 外观子菜单：球大小 + 半透明
         let look = NSMenuItem(title: L("外观", "Appearance"), action: nil, keyEquivalent: "")
@@ -906,7 +1158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         s.snapToEdge.toggle()
         if !s.snapToEdge { s.autoHide = false }   // 不贴边则自动隐藏一并关
         s.save()
-        units.forEach { s.snapToEdge ? $0.snapToNearestEdge(animated: true) : $0.releaseEdge() }
+        units.forEach { $0.showFully() }
+        if let first = units.first { layoutCluster(anchor: first.frameOrigin, orientation: s.orientation, animated: true) }
     }
 
     @objc func toggleAutoHide() {
@@ -914,7 +1167,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard s.snapToEdge else { return }
         s.autoHide.toggle()
         s.save()
-        units.forEach { s.autoHide ? $0.scheduleCollapse() : $0.showFully() }
+        if s.autoHide { scheduleClusterCollapse() } else { units.forEach { $0.showFully() } }
+    }
+
+    // 一键找回：整组弹出并校正到可见区，随后若开着自动隐藏则重新计时收起
+    @objc func summonAll() {
+        recoverCluster()
+        expandCluster()
+        if Settings.shared.autoHide { scheduleClusterCollapse() }
     }
 
     @objc func setScale(_ sender: NSMenuItem) {
@@ -952,8 +1212,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (i, provider) in kProviders.enumerated() {
             let unit = OrbUnit(provider: provider, index: i)
             unit.orbView.menuProvider = { [weak self] in self?.makeMenu() ?? NSMenu() }
+            unit.orbView.onDragBegan = { [weak self] in self?.clusterDragBegan() }
+            unit.orbView.onDragMove = { [weak self] m in self?.clusterDragMove(m) }
+            unit.orbView.onDragEnded = { [weak self] in self?.clusterDragEnded() }
+            unit.onHoverChanged = { [weak self] inside in
+                if inside { self?.expandCluster() } else { self?.scheduleClusterCollapse() }
+            }
             units.append(unit)
         }
+        loadCluster()
         doRefresh()
     }
 }
